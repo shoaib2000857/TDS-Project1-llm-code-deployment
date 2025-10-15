@@ -7,5 +7,6 @@
   "brief": "Publish a static page that gives a basic description of java.",
   "checks": [],
   "evaluation_url": "http://127.0.0.1:9000/notify",
-  "attachments": []
+  "attachments": [
+  ]
 }

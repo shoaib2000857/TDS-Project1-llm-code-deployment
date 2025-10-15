@@ -1,9 +1,9 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from pydantic import BaseModel, HttpUrl
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import os, json, time, base64, subprocess, tempfile, pathlib, requests
 
-app = FastAPI(title="Student API – LLM Code Deployment")
+app = FastAPI(title="Student API - LLM Code Deployment")
 
 # ------------------ Models ------------------
 class Attachment(BaseModel):
@@ -25,7 +25,7 @@ class Task(BaseModel):
 SHARED_SECRET   = os.getenv("STUDENT_SHARED_SECRET")
 GITHUB_TOKEN    = os.getenv("GITHUB_TOKEN")
 GITHUB_USER     = os.getenv("GITHUB_USER")
-DEFAULT_BRANCH  = os.getenv("DEFAULT_BRANCH", "main")  # <<<< one branch everywhere
+DEFAULT_BRANCH  = os.getenv("DEFAULT_BRANCH", "main")  # one branch everywhere
 
 # ------------------ Helpers ------------------
 def verify_secret(s: str):
@@ -44,12 +44,28 @@ def run(cmd: list[str], cwd: Optional[str] = None):
         raise RuntimeError(f"CMD failed: {' '.join(cmd)}\n{res.stdout}\n{res.stderr}")
     return res.stdout.strip()
 
+def wait_for_pages(url: str, max_wait: int = 240, interval: int = 8) -> bool:
+    """Poll the Pages URL until it returns 200 or timeout."""
+    print(f"⏳ Waiting for GitHub Pages: {url}")
+    start = time.time()
+    while time.time() - start < max_wait:
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                print("✅ GitHub Pages is live")
+                return True
+        except requests.RequestException:
+            pass
+        time.sleep(interval)
+    print("⚠️ Timed out waiting for GitHub Pages")
+    return False
+
 # ------------------ GitHub + Pages ------------------
-def create_repo_and_push(task_id: str, app_dir: str) -> tuple[str, str, str]:
+def create_repo_and_push(task_id: str, app_dir: str) -> Tuple[str, str, str]:
     repo = f"{task_id}"
     repo_url = f"https://github.com/{GITHUB_USER}/{repo}"
 
-    # init repo ON THE RIGHT BRANCH
+    # init repo on the correct branch
     run(["git", "init", "-b", DEFAULT_BRANCH], cwd=app_dir)
     run(["git", "config", "user.email", "bot@local"], cwd=app_dir)
     run(["git", "config", "user.name", "Bot"], cwd=app_dir)
@@ -57,17 +73,15 @@ def create_repo_and_push(task_id: str, app_dir: str) -> tuple[str, str, str]:
     # LICENSE
     mit = pathlib.Path(app_dir) / "LICENSE"
     mit_text_path = (pathlib.Path(__file__).parent / ".." / "shared" / "mit.txt").resolve()
-    if mit_text_path.exists():
-        mit.write_text("MIT License\n\n" + mit_text_path.read_text(encoding="utf-8"))
-    else:
-        mit.write_text("MIT License\n\nGenerated automatically.", encoding="utf-8")
+    mit_text = mit_text_path.read_text(encoding="utf-8") if mit_text_path.exists() else "MIT License\n\nGenerated automatically."
+    mit.write_text("MIT License\n\n" + mit_text, encoding="utf-8")
 
     # README
     readme = pathlib.Path(app_dir) / "README.md"
     if not readme.exists():
         readme.write_text("# Auto-generated App\n\nSee LICENSE.", encoding="utf-8")
 
-    # add workflow BEFORE first push so default branch has it
+    # Add Pages workflow BEFORE first push
     wf_dir = pathlib.Path(app_dir) / ".github" / "workflows"
     wf_dir.mkdir(parents=True, exist_ok=True)
     (wf_dir / "pages.yml").write_text(PAGES_WF_YML, encoding="utf-8")
@@ -76,14 +90,14 @@ def create_repo_and_push(task_id: str, app_dir: str) -> tuple[str, str, str]:
     run(["git", "add", "-A"], cwd=app_dir)
     run(["git", "commit", "-m", "init with Pages workflow"], cwd=app_dir)
 
-    # create GH repo from current dir; default branch will be our HEAD (DEFAULT_BRANCH)
+    # create GH repo from current dir; HEAD defines default branch
     run([
         "gh", "repo", "create", f"{GITHUB_USER}/{repo}",
         "--public", "--source=.", "--remote=origin", "--push", "--confirm"
     ], cwd=app_dir)
 
     # enable pages for workflow builds (retry a bit)
-    for i in range(5):
+    for _ in range(5):
         try:
             run(["gh", "api", f"repos/{GITHUB_USER}/{repo}/pages",
                  "-X", "POST", "-f", "build_type=workflow"], cwd=app_dir)
@@ -133,16 +147,25 @@ def generate_llm_app(brief: str, attachments, task_id: str, round_idx: int) -> s
         readme.write_text(f"# Auto App for {task_id}\n\nBrief: {brief}\n", encoding="utf-8")
     return tmp
 
-def update_llm_app(task: Task) -> str:
+def update_llm_app(task: Task) -> Tuple[str, str]:
+    """Clone, update with Gemini, commit & push to DEFAULT_BRANCH. Returns (tmp_dir, commit_sha)."""
     repo = f"{task.task}"
     tmp = tempfile.mkdtemp(prefix=f"update-{repo}-")
 
     # Clone and switch to the ONE branch we use
     run(["git", "clone", f"https://github.com/{GITHUB_USER}/{repo}.git", tmp])
-    run(["git", "checkout", DEFAULT_BRANCH], cwd=tmp)
+    try:
+        run(["git", "checkout", DEFAULT_BRANCH], cwd=tmp)
+    except RuntimeError:
+        run(["git", "checkout", "-B", DEFAULT_BRANCH, f"origin/{DEFAULT_BRANCH}"], cwd=tmp)
 
-    # Re-generate files with Gemini using the new brief
+    # Re-generate files with Gemini
     generate_app_with_gemini(task.brief, tmp, [a.name for a in task.attachments or []])
+
+    # Ensure workflow exists
+    wf_dir = pathlib.Path(tmp) / ".github" / "workflows"
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    (wf_dir / "pages.yml").write_text(PAGES_WF_YML, encoding="utf-8")
 
     # Touch a file to guarantee a diff (ensures Actions re-runs)
     (pathlib.Path(tmp) / ".redeploy").write_text(str(time.time()), encoding="utf-8")
@@ -159,14 +182,16 @@ Automated update & redeploy via Gemini.
 MIT License
 """, encoding="utf-8")
 
-    # Commit + push to the SAME branch
+    # Commit + push
     run(["git", "add", "-A"], cwd=tmp)
     run(["git", "commit", "-m", f"round {task.round}: update app"], cwd=tmp)
     run(["git", "push", "origin", DEFAULT_BRANCH], cwd=tmp)
-    return tmp
+    sha = run(["git", "rev-parse", "HEAD"], cwd=tmp)
+    return tmp, sha
 
 # ------------------ Evaluator notify ------------------
 def notify_evaluator(evaluation_url: str, payload: dict):
+    wait_for_pages(payload["pages_url"])
     for delay in [1, 2, 4, 8, 16]:
         try:
             r = requests.post(evaluation_url, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
@@ -177,20 +202,19 @@ def notify_evaluator(evaluation_url: str, payload: dict):
         except Exception as e:
             print(f"⚠️ Notify failed ({e}), retrying...")
         time.sleep(delay)
-    raise RuntimeError("Failed to notify evaluator after retries.")
+    print("❌ Failed to notify evaluator after retries.")
 
 # ------------------ Endpoint ------------------
 @app.post("/ingest")
-async def ingest(task: Task, req: Request):
+async def ingest(task: Task, req: Request, background_tasks: BackgroundTasks):
     verify_secret(task.secret)
 
     if task.round == 1:
         app_dir = generate_llm_app(task.brief, task.attachments or [], task.task, task.round)
         repo_url, sha, pages_url = create_repo_and_push(task.task, app_dir)
     else:
-        app_dir = update_llm_app(task)
-        repo_url = f"https://github.com/{GITHUB_USER}/{task.task}"
-        sha = run(["git", "rev-parse", "HEAD"], cwd=app_dir)
+        app_dir, sha = update_llm_app(task)
+        repo_url  = f"https://github.com/{GITHUB_USER}/{task.task}"
         pages_url = f"https://{GITHUB_USER}.github.io/{task.task}/"
 
     payload = {
@@ -202,5 +226,9 @@ async def ingest(task: Task, req: Request):
         "commit_sha": sha,
         "pages_url": pages_url
     }
-    notify_evaluator(str(task.evaluation_url), payload)
+
+    # 🧩 Run evaluator notification in the background
+    background_tasks.add_task(notify_evaluator, str(task.evaluation_url), payload)
+
+    # ✅ Respond immediately (no delay waiting for Pages)
     return {"ok": True, "repo_url": repo_url, "commit_sha": sha, "pages_url": pages_url}
