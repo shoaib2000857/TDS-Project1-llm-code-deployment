@@ -3,7 +3,7 @@ from pydantic import BaseModel, HttpUrl
 from typing import List, Optional, Tuple
 import os, json, time, base64, subprocess, tempfile, pathlib, requests
 
-app = FastAPI(title="Student API - LLM Code Deployment")
+app = FastAPI(title="Student API – LLM Code Deployment")
 
 # ------------------ Models ------------------
 class Attachment(BaseModel):
@@ -25,7 +25,7 @@ class Task(BaseModel):
 SHARED_SECRET   = os.getenv("STUDENT_SHARED_SECRET")
 GITHUB_TOKEN    = os.getenv("GITHUB_TOKEN")
 GITHUB_USER     = os.getenv("GITHUB_USER")
-DEFAULT_BRANCH  = os.getenv("DEFAULT_BRANCH", "main")  # one branch everywhere
+DEFAULT_BRANCH  = os.getenv("DEFAULT_BRANCH", "main")
 
 # ------------------ Helpers ------------------
 def verify_secret(s: str):
@@ -65,50 +65,61 @@ def create_repo_and_push(task_id: str, app_dir: str) -> Tuple[str, str, str]:
     repo = f"{task_id}"
     repo_url = f"https://github.com/{GITHUB_USER}/{repo}"
 
-    # init repo on the correct branch
+    # Init repo
     run(["git", "init", "-b", DEFAULT_BRANCH], cwd=app_dir)
     run(["git", "config", "user.email", "bot@local"], cwd=app_dir)
     run(["git", "config", "user.name", "Bot"], cwd=app_dir)
 
     # LICENSE
     mit = pathlib.Path(app_dir) / "LICENSE"
-    mit_text_path = (pathlib.Path(__file__).parent / ".." / "shared" / "mit.txt").resolve()
-    mit_text = mit_text_path.read_text(encoding="utf-8") if mit_text_path.exists() else "MIT License\n\nGenerated automatically."
-    mit.write_text("MIT License\n\n" + mit_text, encoding="utf-8")
+    mit.write_text("MIT License\n\nGenerated automatically.", encoding="utf-8")
 
     # README
     readme = pathlib.Path(app_dir) / "README.md"
     if not readme.exists():
         readme.write_text("# Auto-generated App\n\nSee LICENSE.", encoding="utf-8")
 
-    # Add Pages workflow BEFORE first push
+    # Workflow
     wf_dir = pathlib.Path(app_dir) / ".github" / "workflows"
     wf_dir.mkdir(parents=True, exist_ok=True)
     (wf_dir / "pages.yml").write_text(PAGES_WF_YML, encoding="utf-8")
 
-    # first commit
     run(["git", "add", "-A"], cwd=app_dir)
     run(["git", "commit", "-m", "init with Pages workflow"], cwd=app_dir)
 
-    # create GH repo from current dir; HEAD defines default branch
-    run([
-        "gh", "repo", "create", f"{GITHUB_USER}/{repo}",
-        "--public", "--source=.", "--remote=origin", "--push", "--confirm"
-    ], cwd=app_dir)
+    # ---- Create repo via GitHub REST API ----
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+    payload = {"name": repo, "private": False, "auto_init": False}
+    r = requests.post("https://api.github.com/user/repos", headers=headers, json=payload)
+    if r.status_code == 422 and "already exists" in r.text.lower():
+        print(f"ℹ️ Repo {repo} already exists, continuing.")
+    elif r.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub repo creation failed: {r.status_code} {r.text}")
 
-    # enable pages for workflow builds (retry a bit)
+    # Push code
+    run(["git", "remote", "add", "origin", f"https://github.com/{GITHUB_USER}/{repo}.git"], cwd=app_dir)
+    run(["git", "push", "-u", "origin", DEFAULT_BRANCH], cwd=app_dir)
+
+    # Enable Pages via REST API
     for _ in range(5):
         try:
-            run(["gh", "api", f"repos/{GITHUB_USER}/{repo}/pages",
-                 "-X", "POST", "-f", "build_type=workflow"], cwd=app_dir)
-            break
+            resp = requests.post(
+                f"https://api.github.com/repos/{GITHUB_USER}/{repo}/pages",
+                headers=headers,
+                json={"build_type": "workflow"},
+            )
+            if resp.status_code in (201, 204, 409):
+                break
         except Exception:
-            time.sleep(2)
+            pass
+        time.sleep(2)
 
     sha = run(["git", "rev-parse", "HEAD"], cwd=app_dir)
     pages_url = f"https://{GITHUB_USER}.github.io/{repo}/"
     return repo_url, sha, pages_url
-
 
 PAGES_WF_YML = f"""name: Deploy to Pages
 on:
@@ -148,41 +159,31 @@ def generate_llm_app(brief: str, attachments, task_id: str, round_idx: int) -> s
     return tmp
 
 def update_llm_app(task: Task) -> Tuple[str, str]:
-    """Clone, update with Gemini, commit & push to DEFAULT_BRANCH. Returns (tmp_dir, commit_sha)."""
     repo = f"{task.task}"
     tmp = tempfile.mkdtemp(prefix=f"update-{repo}-")
 
-    # Clone and switch to the ONE branch we use
     run(["git", "clone", f"https://github.com/{GITHUB_USER}/{repo}.git", tmp])
     try:
         run(["git", "checkout", DEFAULT_BRANCH], cwd=tmp)
     except RuntimeError:
         run(["git", "checkout", "-B", DEFAULT_BRANCH, f"origin/{DEFAULT_BRANCH}"], cwd=tmp)
 
-    # Re-generate files with Gemini
     generate_app_with_gemini(task.brief, tmp, [a.name for a in task.attachments or []])
 
-    # Ensure workflow exists
     wf_dir = pathlib.Path(tmp) / ".github" / "workflows"
     wf_dir.mkdir(parents=True, exist_ok=True)
     (wf_dir / "pages.yml").write_text(PAGES_WF_YML, encoding="utf-8")
 
-    # Touch a file to guarantee a diff (ensures Actions re-runs)
     (pathlib.Path(tmp) / ".redeploy").write_text(str(time.time()), encoding="utf-8")
 
-    # README update
     (pathlib.Path(tmp) / "README.md").write_text(f"""# Updated Auto App – {task.task}
 
 **Round:** {task.round}  
 **Brief:** {task.brief}
 
 Automated update & redeploy via Gemini.
-
-## License
-MIT License
 """, encoding="utf-8")
 
-    # Commit + push
     run(["git", "add", "-A"], cwd=tmp)
     run(["git", "commit", "-m", f"round {task.round}: update app"], cwd=tmp)
     run(["git", "push", "origin", DEFAULT_BRANCH], cwd=tmp)
@@ -227,8 +228,6 @@ async def ingest(task: Task, req: Request, background_tasks: BackgroundTasks):
         "pages_url": pages_url
     }
 
-    # 🧩 Run evaluator notification in the background
     background_tasks.add_task(notify_evaluator, str(task.evaluation_url), payload)
 
-    # ✅ Respond immediately (no delay waiting for Pages)
     return {"ok": True, "repo_url": repo_url, "commit_sha": sha, "pages_url": pages_url}
