@@ -1,0 +1,11 @@
+{
+  "email": "student@example.com",
+  "secret": "abc123",
+  "task": "java-describer",
+  "round": 2,
+  "nonce": "xyz999-round2",
+  "brief": "Improve the UI and add descriptions for each Java keyword.",
+  "checks": [],
+  "evaluation_url": "http://127.0.0.1:9000/notify",
+  "attachments": []
+}
