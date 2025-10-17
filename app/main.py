@@ -75,23 +75,21 @@ def _gh_headers():
     }
 
 def _token_remote(repo: str) -> str:
-    # tokenized remote for CI push
     return f"https://{GITHUB_USER}:{GITHUB_TOKEN}@github.com/{GITHUB_USER}/{repo}.git"
 
 def _public_remote(repo: str) -> str:
-    # non-token remote to avoid leaving token in config
     return f"https://github.com/{GITHUB_USER}/{repo}.git"
 
 def create_repo_and_push(task_id: str, app_dir: str) -> Tuple[str, str, str]:
     repo = f"{task_id}"
     repo_url = _public_remote(repo)
 
-    # Init repo on the correct branch
+    # Init repo
     run(["git", "init", "-b", DEFAULT_BRANCH], cwd=app_dir)
     run(["git", "config", "user.email", "bot@local"], cwd=app_dir)
     run(["git", "config", "user.name", "Bot"], cwd=app_dir)
 
-    # Minimal LICENSE + README
+    # LICENSE + README
     (pathlib.Path(app_dir) / "LICENSE").write_text(
         "MIT License\n\nGenerated automatically.", encoding="utf-8"
     )
@@ -99,7 +97,7 @@ def create_repo_and_push(task_id: str, app_dir: str) -> Tuple[str, str, str]:
     if not readme.exists():
         readme.write_text("# Auto-generated App\n\nSee LICENSE.", encoding="utf-8")
 
-    # GitHub Pages workflow on DEFAULT_BRANCH
+    # Pages workflow
     wf_dir = pathlib.Path(app_dir) / ".github" / "workflows"
     wf_dir.mkdir(parents=True, exist_ok=True)
     (wf_dir / "pages.yml").write_text(PAGES_WF_YML, encoding="utf-8")
@@ -107,21 +105,22 @@ def create_repo_and_push(task_id: str, app_dir: str) -> Tuple[str, str, str]:
     run(["git", "add", "-A"], cwd=app_dir)
     run(["git", "commit", "-m", "init with Pages workflow"], cwd=app_dir)
 
-    # Create repo via REST (idempotent)
-    r = requests.post("https://api.github.com/user/repos", headers=_gh_headers(),
-                      json={"name": repo, "private": False, "auto_init": False})
+    # Create repo (idempotent)
+    r = requests.post(
+        "https://api.github.com/user/repos",
+        headers=_gh_headers(),
+        json={"name": repo, "private": False, "auto_init": False},
+    )
     if r.status_code == 422 and "already exists" in r.text.lower():
         print(f"ℹ️ Repo {repo} already exists, continuing.")
     elif r.status_code not in (200, 201):
         raise RuntimeError(f"GitHub repo creation failed: {r.status_code} {r.text}")
 
-    # Push using tokenized remote (Render has no interactive creds)
     run(["git", "remote", "add", "origin", _token_remote(repo)], cwd=app_dir)
     run(["git", "push", "-u", "origin", DEFAULT_BRANCH], cwd=app_dir)
-    # Clean remote URL (avoid token lingering in config)
     run(["git", "remote", "set-url", "origin", repo_url], cwd=app_dir)
 
-    # Enable Pages via REST API (workflow build)
+    # Enable Pages
     for _ in range(5):
         try:
             resp = requests.post(
@@ -171,73 +170,60 @@ def generate_llm_app(brief: str, attachments, task_id: str, round_idx: int) -> s
         (root / att.name).write_bytes(decode_data_uri(att.url))
         names.append(att.name)
 
-    # Call Gemini (will fallback to a minimal page if rate-limited)
     generate_app_with_gemini(brief, tmp, names)
 
-    # Ensure README
     readme = root / "README.md"
     if not readme.exists():
         readme.write_text(f"# Auto App for {task_id}\n\nBrief: {brief}\n", encoding="utf-8")
     return tmp
 
 def update_llm_app(task: Task) -> Tuple[str, str]:
-    """Clone, update with Gemini, commit & push to DEFAULT_BRANCH. Returns (tmp_dir, commit_sha)."""
+    """Clone, regenerate in place (overwriting old), commit & push."""
     repo = f"{task.task}"
     tmp = tempfile.mkdtemp(prefix=f"update-{repo}-")
 
-    # Clone
     run(["git", "clone", _public_remote(repo), tmp])
-    # Switch to branch (track remote if needed)
     try:
         run(["git", "checkout", DEFAULT_BRANCH], cwd=tmp)
     except RuntimeError:
         run(["git", "checkout", "-B", DEFAULT_BRANCH, f"origin/{DEFAULT_BRANCH}"], cwd=tmp)
 
-    # Update with Gemini (fallback-safe)
+    # Clean old generated files but keep metadata
+    for f in pathlib.Path(tmp).glob("*"):
+        if f.is_file() and f.name not in ("LICENSE", "README.md"):
+            f.unlink()
+
     generate_app_with_gemini(task.brief, tmp, [a.name for a in task.attachments or []])
 
-    # Ensure workflow exists (in case repo was missing it)
     wf_dir = pathlib.Path(tmp) / ".github" / "workflows"
     wf_dir.mkdir(parents=True, exist_ok=True)
     (wf_dir / "pages.yml").write_text(PAGES_WF_YML, encoding="utf-8")
 
-    # Guarantee a diff to retrigger Actions
     (pathlib.Path(tmp) / ".redeploy").write_text(str(time.time()), encoding="utf-8")
 
-    # README touch
-    (pathlib.Path(tmp) / "README.md").write_text(f"""# Updated Auto App – {task.task}
-
-**Round:** {task.round}  
-**Brief:** {task.brief}
-
-Automated update & redeploy via Gemini.
-""", encoding="utf-8")
-
-    # Tokenize remote for push, push, then clean
-    run(["git", "remote", "set-url", "origin", _token_remote(repo)], cwd=tmp)
-
-    # ⚙️ Set commit identity (Render has no global git config)
     run(["git", "config", "user.email", "bot@local"], cwd=tmp)
     run(["git", "config", "user.name", "Bot"], cwd=tmp)
 
     run(["git", "add", "-A"], cwd=tmp)
-    run(["git", "commit", "-m", f"round {task.round}: update app"], cwd=tmp)
+    run(["git", "commit", "-m", f"round {task.round}: regenerate app"], cwd=tmp)
+    run(["git", "remote", "set-url", "origin", _token_remote(repo)], cwd=tmp)
     run(["git", "push", "origin", DEFAULT_BRANCH], cwd=tmp)
     run(["git", "remote", "set-url", "origin", _public_remote(repo)], cwd=tmp)
 
     sha = run(["git", "rev-parse", "HEAD"], cwd=tmp)
     return tmp, sha
 
-
 # ------------------ Evaluator notify ------------------
 def notify_evaluator(evaluation_url: str, payload: dict):
-    # Optional: wait for Pages to be live before notifying
     wait_for_pages(payload["pages_url"])
     for delay in [1, 2, 4, 8, 16]:
         try:
-            r = requests.post(evaluation_url, json=payload,
-                              headers={"Content-Type": "application/json"},
-                              timeout=30)
+            r = requests.post(
+                evaluation_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
             if r.status_code == 200:
                 print("✅ Evaluator notified successfully.")
                 return
@@ -276,10 +262,8 @@ async def ingest(task: Task, req: Request, background_tasks: BackgroundTasks):
         "nonce": task.nonce,
         "repo_url": repo_url,
         "commit_sha": sha,
-        "pages_url": pages_url
+        "pages_url": pages_url,
     }
 
-    # Notify in background; return HTTP 200 immediately
     background_tasks.add_task(notify_evaluator, str(task.evaluation_url), payload)
-
     return {"ok": True, "repo_url": repo_url, "commit_sha": sha, "pages_url": pages_url}

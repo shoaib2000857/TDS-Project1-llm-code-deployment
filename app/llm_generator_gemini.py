@@ -1,4 +1,4 @@
-import os, re, pathlib
+import os, re, pathlib, time
 import google.generativeai as genai
 from typing import List, Dict
 
@@ -30,28 +30,23 @@ def _extract_files_from_markdown(md: str) -> Dict[str, str]:
 def _prompt_for_webapp(brief: str, attachment_names: List[str]) -> str:
     import json
     return f"""
-You are an expert frontend engineer. Build a small, production-ready static web app for the following brief:
+You are an expert frontend engineer. Rebuild a clean, production-ready static web app for the following brief:
 
 BRIEF:
 {brief}
 
-ATTACHMENTS AVAILABLE IN THE SAME FOLDER (relative URLs):
+ATTACHMENTS (relative URLs):
 {json.dumps(attachment_names)}
 
 REQUIREMENTS:
-- Output your ENTIRE solution as fenced code blocks only. Use these blocks:
-  - ```html ...``` for HTML (must include <head> with meta charset and title)
-  - ```css ...``` for styles (optional)
-  - ```javascript ...``` for logic (optional)
-- The app must be fully static (no server code) and work over GitHub Pages.
-- If the brief mentions query params (e.g. ?url=...), implement them using browser fetch.
-- If attachments include data files (e.g. input.md, data.csv), load them with relative fetch('input.md') etc.
-- Include minimal accessibility (labels, aria-live when specified).
-- Avoid external secrets. If a token param is mentioned, accept via ?token= in URL.
-- Keep it small and clean. No build tools.
-
-DELIVERABLE:
-- Provide only the code blocks. Do not add explanations outside code blocks.
+- Output only fenced code blocks:
+  - ```html``` main HTML (with <head> + title)
+  - ```css``` for styling
+  - ```javascript``` for logic
+- Fully static. Must run on GitHub Pages.
+- If attachments include data, load via fetch('filename').
+- Keep design simple, accessible, and elegant.
+- Avoid commentary or markdown outside code blocks.
 """
 
 def _write_minimal_fallback(work_dir: str, brief: str):
@@ -74,7 +69,10 @@ def _write_minimal_fallback(work_dir: str, brief: str):
 </body>
 </html>
 """, encoding="utf-8")
-    (root / "style.css").write_text("body{font-family:system-ui,Arial,sans-serif;padding:2rem}pre{white-space:pre-wrap}", encoding="utf-8")
+    (root / "style.css").write_text(
+        "body{font-family:system-ui,Arial,sans-serif;padding:2rem}pre{white-space:pre-wrap}",
+        encoding="utf-8",
+    )
     (root / "script.js").write_text("console.log('fallback app ready');", encoding="utf-8")
 
 def generate_app_with_gemini(brief: str, work_dir: str, attachment_names: List[str]) -> None:
@@ -96,6 +94,7 @@ def generate_app_with_gemini(brief: str, work_dir: str, attachment_names: List[s
                 max_output_tokens=4096,
             ),
         )
+
         text = (getattr(resp, "text", None) or "").strip()
         if not text:
             print("⚠️ Gemini returned empty — writing fallback app.")
@@ -104,7 +103,6 @@ def generate_app_with_gemini(brief: str, work_dir: str, attachment_names: List[s
 
         files = _extract_files_from_markdown(text)
         if "index.html" not in files:
-            # ensure an index.html exists
             first = next(iter(files.values()))
             files["index.html"] = first
 
@@ -112,7 +110,8 @@ def generate_app_with_gemini(brief: str, work_dir: str, attachment_names: List[s
         for name, content in files.items():
             (root / name).write_text(content, encoding="utf-8")
 
+        print(f"✅ Gemini generated: {list(files.keys())}")
+
     except Exception as e:
-        # Handle rate limits and any other API issues
         print(f"⚠️ Gemini error: {e} — writing fallback app.")
         _write_minimal_fallback(work_dir, brief)
