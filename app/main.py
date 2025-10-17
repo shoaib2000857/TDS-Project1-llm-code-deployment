@@ -215,6 +215,11 @@ Automated update & redeploy via Gemini.
 
     # Tokenize remote for push, push, then clean
     run(["git", "remote", "set-url", "origin", _token_remote(repo)], cwd=tmp)
+
+    # ⚙️ Set commit identity (Render has no global git config)
+    run(["git", "config", "user.email", "bot@local"], cwd=tmp)
+    run(["git", "config", "user.name", "Bot"], cwd=tmp)
+
     run(["git", "add", "-A"], cwd=tmp)
     run(["git", "commit", "-m", f"round {task.round}: update app"], cwd=tmp)
     run(["git", "push", "origin", DEFAULT_BRANCH], cwd=tmp)
@@ -222,6 +227,7 @@ Automated update & redeploy via Gemini.
 
     sha = run(["git", "rev-parse", "HEAD"], cwd=tmp)
     return tmp, sha
+
 
 # ------------------ Evaluator notify ------------------
 def notify_evaluator(evaluation_url: str, payload: dict):
